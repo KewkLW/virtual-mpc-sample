@@ -45,10 +45,14 @@ Windows；在 Apple Silicon 上速度最快。
 需要 QEMU 9+、Docker（仅构建时需要）、Python 3.9+ 和 OpenSSH 客户端。
 
 1. 克隆本仓库。
-2. 将固件分区放入 `firmware/extracted/`（已被 git 忽略）：`part1`（boot）、`part2`（rootfs）、
-   `parr`（recovery），均提取自 inMusic 的 `MPCSAMPLE-1.3.0.12-update.img`。构建时会用
-   `inputs.sha256` 校验。本仓库暂时没有更新镜像的解包工具
-   （[详情](docs/CUSTOM_FIRMWARE.md#4-another-stock-firmware-version)）。
+2. 准备好你自己的 inMusic MPC Sample 固件更新 1.3.0.12，并提取其中的分区：
+
+   ```bash
+   python3 lab.py extract 更新文件路径   # MPCSAMPLE-1.3.0.12-update.img，或包含它的 .zip
+   ```
+
+   镜像可能在下载的更新程序里：`extract` 也接受包含 `...Update.img` 文件的 `.zip`。
+   分区会放入 `firmware/extracted/`（已被 git 忽略），构建时会用 `inputs.sha256` 校验。
 3. 构建并运行：
 
    ```bash
@@ -65,6 +69,7 @@ python3 lab.py stop              # 电源键 + "Yes"：保存、关机、退出 
 python3 lab.py reset             # 下次从干净的 eMMC 启动
 ```
 
+Linux 请看 [docs/LINUX.md](docs/LINUX.md)（英文）：软件包、`run --headless`、与 macOS 的差别。
 Windows 上使用 `py lab.py ...`。macOS 上请从 Terminal.app 或 iTerm 启动，不要在 IDE 或其他应用的
 终端面板中启动：macOS 可能会降低其优先级，导致声音出现爆音。
 
@@ -94,8 +99,8 @@ Windows 上使用 `py lab.py ...`。macOS 上请从 Terminal.app 或 iTerm 启�
 
 以下任何一项都欢迎贡献：
 
-- **固件解包工具**，用于 `AZ0x` 更新镜像，让配置只需一条命令。这是目前新用户面临的最大障碍。
-- **在 Windows 和 Linux 上运行。** 相关代码已存在，但只在 macOS（Apple Silicon）上实际运行过。
+- **在 Windows 和更多 Linux 上运行。** 已在 macOS（Apple Silicon）和 x86_64 Linux 上实际运行过
+  （[docs/LINUX.md](docs/LINUX.md)）；Windows 和 arm64 Linux（KVM）尚未运行过。
 - **预编译的内核和音频桥** 作为 release 下载，省去 15 分钟的 Docker 构建。
 - **CI**：在每个 pull request 上运行 `make test`（实验室和面板的自检）。
 - **模拟 USB-C 上的 USB 音频（UAC2）**；目前未启用，因为它无法绑定到实验室的 USB 控制器上。

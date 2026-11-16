@@ -134,13 +134,20 @@ still needs a way onto the device, such as an autorun package (1).
 1. Get the inMusic update image for that version (`MPCSAMPLE-<version>-update.img`).
 2. Extract its partitions into `FW_DIR` (default `./firmware`, git-ignored):
 
+   ```bash
+   python3 lab.py extract MPCSAMPLE-<version>-update.img
+   ```
+
    ```
    $FW_DIR/extracted/part1   boot partition (ext2 with kernel.fit)
    $FW_DIR/extracted/part2   rootfs (ext4 with the dm-verity hash tree)
    $FW_DIR/extracted/parr    recovery partition (ext2)
+   $FW_DIR/Firmware/         the update image itself
    ```
 
-   The update image is an `AZ0x` container. This repository has no extractor for it.
+   The update image is an `AZ0x` container; its layout is described above `az0x_sections`
+   in `lab.py`. `extract` was written from the 1.3.0.12 image and checks each section's
+   SHA-256; for an image that `inputs.sha256` does not list it says so and still extracts.
 3. Write the new SHA-256 values into `inputs.sha256`, so that `build` checks them:
 
    ```bash

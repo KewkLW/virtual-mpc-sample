@@ -41,6 +41,7 @@ with the device, time the device from power-on to a ready screen.
 Everything is one Python script, `lab.py` (Windows: `py lab.py ...`). The Makefile only wraps it.
 
 ```bash
+python3 lab.py extract UPDATE   # firmware partitions from inMusic's update image (.img or a .zip with it)
 python3 lab.py build        # Docker: kernel (~15 min once), audio bridge, disk images, factory library
 python3 lab.py run          # the VM with a QEMU window; starts the panel too
 python3 lab.py ssh          # root shell in the VM (the lab's own sshd, port 2022)
@@ -183,7 +184,7 @@ taken at build time from the initramfs in the stock kernel FIT and drawn by the 
 
 | | macOS (Apple Silicon) | Windows 10/11 | Linux |
 |---|---|---|---|
-| QEMU 9+ | `brew install qemu` | qemu.org installer, add to PATH | distro package |
+| QEMU 9+ | `brew install qemu` | qemu.org installer, add to PATH | distro packages, see [LINUX.md](LINUX.md) |
 | Docker (only for `build`) | Docker Desktop | Docker Desktop (WSL 2) | Docker |
 | Python 3.9+, OpenSSH client | built in | python.org, OpenSSH is built in | distro packages |
 | CPU acceleration | HVF | none for an ARM guest: TCG software emulation | KVM on arm64 hosts, else TCG |
@@ -194,6 +195,8 @@ guest CPU is a modelled Cortex-A55, the device's core. Measured on this Mac unde
 boot 28 s, project ready at 88 s, panel latency ~100 ms (same as HVF), but the app's
 128-frame audio stream breaks and recovers about once a second (clicks), and QEMU uses
 ~1.7 host cores. On Windows/x86 expect the same order; it has not been run on Windows yet.
+Linux on x86_64 has been run: [LINUX.md](LINUX.md). Under TCG the lab uses a larger audio
+buffer (`snd_aloop.min_buffer=4096`), because a busy host otherwise breaks the app's stream.
 
 All host-side links are TCP on 127.0.0.1: panel UART 5551, MIDI UART 5552, console 5553,
 QMP 5554/5555, audio bridge 5556, sound 5557, VNC 5910 (the page's screen), lab ssh 2022, the device's USB-network ssh 192.168.155.1:2222 -> 2222, panel web page 8765. The 9p share (`share/` =

@@ -2,6 +2,7 @@
 """Virtual MPC Sample: one launcher for macOS, Windows and Linux.
 
     python3 lab.py build              # Docker: tools image, kernel, bridge, disk images
+    python3 lab.py extract IMAGE      # firmware partitions from inMusic's update image (.img, or a .zip holding it)
     python3 lab.py run [--headless] [--accel tcg]
     python3 lab.py panel              # virtual MPC Sample at http://127.0.0.1:8765/
     python3 lab.py ssh [command...]   # root shell in the VM
@@ -73,7 +74,10 @@ def qmp(command, port=None, **arguments):
             f.write(json.dumps(cmd) + "\n")
             f.flush()
             while True:
-                reply = json.loads(f.readline())
+                try:
+                    reply = json.loads(f.readline())
+                except (ConnectionResetError, json.JSONDecodeError):
+                    return {}                   # "quit": QEMU closes the socket instead of answering
                 if "event" not in reply:
                     break
         return reply
@@ -139,10 +143,26 @@ def wait_closed(port, seconds):
 
 
 def docker(*args, mounts=()):
-    cmd = ["docker", "run", "--rm", "-v", "mpclab-build:/build", "-v", f"{LAB}:/lab"]
+    # With SELinux on (Fedora and others) a container may only touch a bind mount that is
+    # labelled for it: "z" asks Docker to do that. Elsewhere the option is left out.
+    z = os.path.exists("/sys/fs/selinux/enforce")
+    cmd = ["docker", "run", "--rm", "-v", "mpclab-build:/build", "-v", f"{LAB}:/lab" + (":z" if z else "")]
     for src, dst in mounts:
-        cmd += ["-v", f"{src}:{dst}:ro"]
+        cmd += ["-v", f"{src}:{dst}:ro" + (",z" if z else "")]
     subprocess.run(cmd + [IMAGE, *args], check=True)
+
+
+def own_outputs():
+    """Docker's daemon on Linux runs the container as root, so what a build writes to out/
+    belongs to root: `lab.py ssh` could then not read its own key, and `run` could not
+    write next to the images. Give the files back to the user. Rootless Docker, Podman and
+    Docker Desktop map root in the container to the user already; nothing to do there."""
+    if not sys.platform.startswith("linux") or not os.getuid() or not os.path.isdir(OUT):
+        return
+    for root, dirs, files in os.walk(OUT):
+        if any(os.lstat(os.path.join(root, n)).st_uid != os.getuid() for n in dirs + files):
+            docker("chown", "-R", f"{os.getuid()}:{os.getgid()}", "/lab/out")
+            return
 
 
 # ----------------------------------------------------------------------------- device tree
@@ -279,6 +299,50 @@ def qarg(path):
 
 
 # ----------------------------------------------------------------------------- run
+# Linux distributions ship QEMU in pieces: the aarch64 system emulator and, on some, each
+# device model as its own package. Check before the VM starts, and say what is missing.
+QEMU_DEVICES = ("virtio-gpu-pci", "virtio-blk-pci", "virtio-net-pci", "virtio-serial-pci", "virtconsole",
+                "virtserialport", "virtio-tablet-pci", "virtio-keyboard-pci", "sdhci-pci", "sd-card")
+QEMU_HINTS = {   # distribution id (os-release ID / ID_LIKE) -> packages that usually hold all of it
+    "arch": "qemu-system-aarch64 qemu-hw-display-virtio-gpu qemu-hw-display-virtio-gpu-pci qemu-img",
+    "debian": "qemu-system-arm qemu-utils",
+    "fedora": "qemu-system-aarch64 qemu-device-display-virtio-gpu qemu-device-display-virtio-gpu-pci qemu-img",
+    "suse": "qemu-arm qemu-tools",
+}
+
+
+def qemu_hint():
+    ids = []
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key in ("ID", "ID_LIKE"):
+                    ids += value.strip('"').split()
+    except OSError:
+        pass
+    for name, packages in QEMU_HINTS.items():
+        if any(name in i for i in ids):
+            return f" On this distribution the packages are usually: {packages}"
+    return ""
+
+
+def check_qemu(qemu):
+    """Stop with a clear message when this QEMU is too old or lacks a device the VM needs."""
+    r = subprocess.run([qemu, "--version"], capture_output=True, text=True)
+    m = re.search(r"version (\d+)\.(\d+)", r.stdout)
+    if not m:
+        die(f"{qemu} --version gave no version: is this QEMU?")
+    if int(m.group(1)) < 9:
+        die(f"QEMU {m.group(1)}.{m.group(2)} is too old: the lab needs QEMU 9 or newer")
+    r = subprocess.run([qemu, "-M", "virt", "-device", "help"], capture_output=True, text=True)
+    have = set(re.findall(r'name "([^"]+)"', r.stdout + r.stderr))
+    missing = [d for d in QEMU_DEVICES if d not in have]
+    if missing:
+        hint = qemu_hint() if sys.platform.startswith("linux") else ""
+        die(f"this QEMU has no {', '.join(missing)}: install the package(s) with these device models." + hint)
+
+
 def accel_choice(want):
     if want != "auto":
         return want
@@ -299,6 +363,7 @@ def cmd_run(a):
     os.makedirs(RUN, exist_ok=True)
     os.makedirs(SHARE, exist_ok=True)
     qemu, qimg = tool("qemu-system-aarch64"), tool("qemu-img")
+    check_qemu(qemu)
     accel = accel_choice(a.accel)
     cpu = "host" if accel in ("hvf", "kvm") else "cortex-a55"
     machine = ["-M", "virt", "-accel", accel if accel != "tcg" else "tcg,thread=multi", "-cpu", cpu, "-smp", "4", "-m", "2G"]
@@ -317,6 +382,14 @@ def cmd_run(a):
     # this halved the clicks for ~15 ms more pad latency. `--extra snd_aloop.min_buffer=0`
     # gives the device's buffer back (the later option wins). Kernel patch 0003.
     BUFFER = "snd_aloop.min_buffer=1024"
+    if accel == "tcg":
+        # Software emulation stalls a vCPU for much longer when the host is busy. With 1024
+        # frames the app's stream then failed for good ("Unexpected audio capture error: -5")
+        # and the next Load Project or New Project hung. 4096 frames (93 ms) make that rarer,
+        # not impossible: on an x86 Linux host, 2026-11-16, it still failed once at a load
+        # average near 90 on 32 threads, and in a run of several hours with QEMU at nice -10
+        # the stream reported three errors and went on each time. Costs ~70 ms pad latency.
+        BUFFER = "snd_aloop.min_buffer=4096"
     # Stock command line from the signed FIT (extracted at build time), eMMC = first virtio disk.
     # tty1 stays empty under the boot splash: no cursor, no stock getty login prompt there
     # nohz=off: tickless idle made HVF wake idle vCPUs 15-30 ms late for every disk read
@@ -333,7 +406,14 @@ def cmd_run(a):
     os.makedirs(SDCARD, exist_ok=True)
     if not os.path.exists(SD_IMG) and os.listdir(SDCARD):
         sdcard_image(qimg)
-    card = f",file={qarg(SD_IMG)},format=raw" if os.path.exists(SD_IMG) else ""
+    # QEMU 11 calls an sd-card that starts without a medium "not removable": a card could
+    # never be inserted later ("Device 'sd0' is not removable"). So an empty slot starts
+    # with a blank placeholder, which is taken out before the guest runs (-S below).
+    blank = None if os.path.exists(SD_IMG) else os.path.join(RUN, "no-card.img")
+    if blank:
+        with open(blank, "wb") as f:
+            f.truncate(1 << 20)
+    card = f",file={qarg(blank or SD_IMG)},format=raw"
 
     def tcp(name, port, extra=""):
         return f"socket,id={name},host={HOST},port={port},server=on,wait=off{extra}"
@@ -366,6 +446,8 @@ def cmd_run(a):
            "-no-shutdown"]   # a guest poweroff only stops the guest; POWER turns it on again
     if a.headless:
         cmd += ["-display", "none"]
+    if blank:
+        cmd += ["-S"]
     if not WIN:   # 9p share (/lab in the VM) is a convenience; QEMU for Windows has no virtfs
         cmd += ["-virtfs", f"local,path={SHARE},mount_tag=lab,security_model=none"]
     # The panel server is the panel MCU: start it first, as the MCU is there from power-on
@@ -382,6 +464,14 @@ def cmd_run(a):
     # the device down the way its power key does (the app saves first) instead of killing it.
     group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {"start_new_session": True}
     proc = subprocess.Popen(cmd, env=env, **group)
+    if blank:                                   # empty the slot, then let the guest start
+        for _ in range(100):
+            if port_open(PORTS["qmp"]) or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if proc.poll() is None:
+            qmp("eject", id="sd0", force=True)
+            qmp("cont")
     try:
         while True:
             try:
@@ -654,7 +744,7 @@ def autorun_results():
     """Script runner lines of this boot, the card's files and the tail of logs scripts leave."""
     return guest("""journalctl -b --no-pager -o short-monotonic 2>/dev/null | grep -iE 'run script|script-runner|autorun' | tail -n 15
 for m in /media/*/; do [ -d "$m/autorun" ] || continue; echo; echo "== $m"; ls -la "$m" "$m/autorun" 2>&1; done
-for f in /media/*/autorun/*.txt /media/*/*.txt /run/*/events.txt /run/*/*.log; do [ -f "$f" ] && {{ echo; echo "== $f"; tail -n 25 "$f"; }; done; true""",
+for f in /media/*/autorun/*.txt /media/*/*.txt /run/*/events.txt /run/*/*.log; do [ -f "$f" ] && { echo; echo "== $f"; tail -n 25 "$f"; }; done; true""",
                  timeout=60).decode(errors="replace")
 
 
@@ -675,7 +765,13 @@ def cmd_panel(a):
 # ----------------------------------------------------------------------------- build (Docker)
 def cmd_build(a):
     subprocess.run(["docker", "build", "-q", "-t", IMAGE, os.path.join(LAB, "docker")], check=True)
-    steps = a.steps or ["kernel", "bridge", "images", "content"]
+    try:
+        build_steps(a.steps or ["kernel", "bridge", "images", "content"])
+    finally:
+        own_outputs()
+
+
+def build_steps(steps):
     if "kernel" in steps:
         docker("sh", "/lab/scripts/build-kernel.sh")
     if "bridge" in steps:
@@ -696,6 +792,115 @@ def cmd_build(a):
             die("stop the VM first (python3 lab.py stop): the content step rewrites the eMMC base image")
         else:
             docker("sh", "/lab/scripts/build-content.sh", mounts=[(CONTENT_DIR, "/content")])
+
+
+# ----------------------------------------------------------------------------- firmware update image
+# inMusic's update image is an "AZ0x" container (little endian), worked out from 1.3.0.12:
+#   0x00  "AZ0x", u32 version, u32 0
+#   0x0c  u32 offset of the string table: NUL-terminated names (snapshot, product, board, sections)
+#   then a section table, 0x40 bytes per entry:
+#         char tag[4] (BOOT, PARR, PART), u32 compression (0 stored, 1 xz), u64 offset in the file,
+#         u64 stored size, u32 name (offset in the string table, 0 = none), u32 0, u8 sha256[32] of
+#         the stored bytes
+#   then a signature block and the payloads.
+AZ0X_ENTRY = struct.Struct("<4sIQQII32s")
+AZ0X_TAGS = (b"BOOT", b"PARR", b"PART")
+AZ0X_FILES = {"boot": "part1", "rootfs": "part2", "recovery": "parr"}   # section name -> the name the build reads
+
+
+def az0x_sections(img):
+    """[(tag, compression, offset, size, name, sha256)] of an AZ0x image; ValueError if it is not one."""
+    if img[:4] != b"AZ0x":
+        raise ValueError("not an AZ0x update image")
+    strtab = struct.unpack_from("<I", img, 0x0C)[0]
+    start = next((o for o in range(strtab, min(len(img) - 4, 0x10000), 4) if img[o:o + 4] in AZ0X_TAGS), None)
+    if start is None:
+        raise ValueError("no section table in the update image")
+    out = []
+    while img[start:start + 4] in AZ0X_TAGS:
+        tag, comp, pos, size, name, _, digest = AZ0X_ENTRY.unpack_from(img, start)
+        if pos + size > len(img):
+            raise ValueError(f"section {tag.decode()} runs past the end of the image")
+        text = img[strtab + name:img.index(b"\0", strtab + name)].decode("ascii", "replace") if name else ""
+        out.append((tag.decode(), comp, pos, size, text, digest))
+        start += AZ0X_ENTRY.size
+    return out
+
+
+def az0x_payload(img, section):
+    import hashlib
+    import lzma
+    tag, comp, pos, size, name, digest = section
+    stored = img[pos:pos + size]
+    if hashlib.sha256(stored).digest() != digest:
+        raise ValueError(f"section {tag} {name}: the image is damaged (SHA-256 of the section differs)")
+    if comp == 0:
+        return stored
+    if comp == 1:
+        try:
+            return lzma.decompress(stored, format=lzma.FORMAT_XZ)
+        except lzma.LZMAError as e:
+            raise ValueError(f"section {tag} {name}: {e}") from None
+    raise ValueError(f"section {tag} {name}: unknown compression {comp}")
+
+
+def cmd_extract(a):
+    """Firmware partitions out of the update image, into FW_DIR where `build` looks for them."""
+    import hashlib
+    import zipfile
+    src = a.image
+    if not os.path.isfile(src):
+        die(f"{src}: no such file")
+    if zipfile.is_zipfile(src):                 # e.g. the updater download: the image is a file inside
+        with zipfile.ZipFile(src) as z:
+            inside = [i for i in z.infolist() if i.filename.lower().endswith("update.img")]
+            if not inside:
+                die(f"{src}: no update image (a file named ...Update.img) in this zip")
+            info = max(inside, key=lambda i: i.file_size)
+            print(f"lab: {info.filename} from the zip")
+            img = z.read(info)
+    else:
+        with open(src, "rb") as f:
+            img = f.read()
+    try:
+        sections = az0x_sections(img)
+    except ValueError as e:
+        die(f"{src}: {e}")
+    wanted = {}                                 # path under FW_DIR -> expected SHA-256
+    with open(os.path.join(LAB, "inputs.sha256")) as f:
+        for line in f:
+            digest, rel = line.split(None, 1)
+            wanted[rel.strip()] = digest
+    digest = hashlib.sha256(img).hexdigest()
+    keep = next((rel for rel, d in wanted.items() if d == digest), None)
+    if keep is None:
+        keep = os.path.join("Firmware", os.path.basename(src) if not zipfile.is_zipfile(src) else "update.img")
+        print("lab: this is not the image that inputs.sha256 lists (another firmware version?): "
+              "`build` will refuse it until inputs.sha256 has its values, see docs/CUSTOM_FIRMWARE.md")
+    os.makedirs(os.path.join(FW_DIR, "extracted"), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.join(FW_DIR, keep)), exist_ok=True)
+    with open(os.path.join(FW_DIR, keep), "wb") as f:
+        f.write(img)
+    print(f"{keep}: {len(img)} bytes")
+    done = set()
+    for section in sections:
+        name = AZ0X_FILES.get(section[4])
+        if not name:
+            continue                            # the bootloader: the lab boots its own kernel
+        try:
+            data = az0x_payload(img, section)
+        except ValueError as e:
+            die(str(e))
+        rel = "extracted/" + name
+        with open(os.path.join(FW_DIR, rel), "wb") as f:
+            f.write(data)
+        ok = wanted.get(rel) == hashlib.sha256(data).hexdigest()
+        print(f"{rel}: {len(data)} bytes" + (", matches inputs.sha256" if ok else ", NOT the value in inputs.sha256"))
+        done.add(name)
+    missing = sorted(set(AZ0X_FILES.values()) - done)
+    if missing:
+        die(f"the image has no section for: {', '.join(missing)}")
+    print(f"lab: firmware is in {FW_DIR}; next: python3 lab.py build")
 
 
 def verify_inputs():
@@ -762,6 +967,36 @@ def selftest():
             raise AssertionError("zip with ../ accepted")
         except ValueError:
             pass
+    # AZ0x update image: one stored and one xz section, found and unpacked; damage is noticed
+    import hashlib
+    import lzma
+    strings = b"\0snap\0boot\0rootfs\0"
+    parts = [(b"BOOT", 0, b"", b"bootloader"), (b"PART", 1, b"boot", lzma.compress(b"B" * 5000)),
+             (b"PART", 1, b"rootfs", lzma.compress(b"R" * 9000))]
+    table_at = 0x40
+    data_at = table_at + AZ0X_ENTRY.size * len(parts) + 16
+    table, blob = b"", b""
+    for tag, comp, name, stored in parts:
+        table += AZ0X_ENTRY.pack(tag, comp, data_at + len(blob), len(stored), strings.index(name) if name else 0, 0,
+                                 hashlib.sha256(stored).digest())
+        blob += stored
+    img = (b"AZ0x" + struct.pack("<II", 1, 0) + struct.pack("<I", 0x10) + strings).ljust(table_at, b"\0")
+    img += table + b"\0" * 16 + blob
+    secs = az0x_sections(img)
+    assert [(x[0], x[4]) for x in secs] == [("BOOT", ""), ("PART", "boot"), ("PART", "rootfs")], secs
+    assert az0x_payload(img, secs[0]) == b"bootloader" and az0x_payload(img, secs[2]) == b"R" * 9000
+    broken = bytearray(img)
+    broken[-3] ^= 1
+    try:
+        az0x_payload(bytes(broken), secs[2])
+        raise AssertionError("damaged section accepted")
+    except ValueError:
+        pass
+    try:
+        az0x_sections(b"nope" + img[4:])
+        raise AssertionError("wrong magic accepted")
+    except ValueError:
+        pass
     print("lab selftest ok")
 
 
@@ -770,6 +1005,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("steps", nargs="*", help="any of: kernel bridge tools images content (default: kernel bridge images content)")
+    x = sub.add_parser("extract", help="firmware partitions from inMusic's update image into FW_DIR")
+    x.add_argument("image", help="MPCSAMPLE-<version>-update.img, or a .zip that holds an ...Update.img")
     r = sub.add_parser("run")
     r.add_argument("--headless", action="store_true")
     r.add_argument("--accel", default="auto", help="hvf, kvm, tcg (default: auto)")
@@ -787,7 +1024,7 @@ def main():
     for n in ("panel", "stop", "reset", "status", "selftest"):
         sub.add_parser(n)
     a = ap.parse_args()
-    {"build": cmd_build, "run": cmd_run, "panel": cmd_panel, "ssh": cmd_ssh, "preload": cmd_preload, "autorun": cmd_autorun,
+    {"build": cmd_build, "extract": cmd_extract, "run": cmd_run, "panel": cmd_panel, "ssh": cmd_ssh, "preload": cmd_preload, "autorun": cmd_autorun,
      "stop": cmd_stop, "reset": cmd_reset, "status": cmd_status, "selftest": lambda _: selftest()}[a.cmd](a)
 
 

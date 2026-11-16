@@ -53,11 +53,16 @@ Not yet: USB audio over USB-C, a Windows test run, other firmware versions. See 
 You need QEMU 9+, Docker (only for the build), Python 3.9+ and an OpenSSH client.
 
 1. Clone the repository.
-2. Put the firmware partitions in `firmware/extracted/` (git-ignored):
-   `part1` (boot), `part2` (rootfs), `parr` (recovery), extracted from inMusic's
-   `MPCSAMPLE-1.3.0.12-update.img`. The build checks them against `inputs.sha256`.
-   This repository has no extractor for the update image yet
-   ([details](docs/CUSTOM_FIRMWARE.md#4-another-stock-firmware-version)).
+2. Get your own copy of inMusic's firmware update 1.3.0.12 for the MPC Sample and extract
+   its partitions:
+
+   ```bash
+   python3 lab.py extract PATH/TO/UPDATE   # MPCSAMPLE-1.3.0.12-update.img, or a .zip that holds it
+   ```
+
+   The image may be inside an updater download: `extract` also takes a `.zip` that holds a
+   file named `...Update.img`. The partitions go to `firmware/extracted/` (git-ignored) and
+   the build checks them against `inputs.sha256`.
 3. Build and run:
 
    ```bash
@@ -74,6 +79,7 @@ python3 lab.py stop              # power key + "Yes": saves, shuts down, QEMU ex
 python3 lab.py reset             # next start from a clean eMMC
 ```
 
+On Linux see [docs/LINUX.md](docs/LINUX.md): packages, `run --headless`, what differs.
 On Windows use `py lab.py ...`. On macOS start the lab from Terminal.app or iTerm, not from
 an IDE's or another app's terminal pane: macOS may throttle it, and the sound clicks.
 
@@ -82,6 +88,7 @@ an IDE's or another app's terminal pane: macOS may throttle it, and the sound cl
 | | |
 |---|---|
 | [docs/USAGE.md](docs/USAGE.md) | full guide: factory library, USB-C, SD autoruns, host requirements, ports |
+| [docs/LINUX.md](docs/LINUX.md) | Linux: packages per distribution, what was run, what differs from macOS |
 | [docs/PANEL.md](docs/PANEL.md) | the virtual panel, its protocol, sound, the SD card |
 | [docs/CUSTOM_FIRMWARE.md](docs/CUSTOM_FIRMWARE.md) | your own code: autorun packages, `LD_PRELOAD`, lab layer files, other firmware versions |
 | [docs/MPC_SAMPLE_VIRTUAL_LAB_ARCHITECTURE.md](docs/MPC_SAMPLE_VIRTUAL_LAB_ARCHITECTURE.md) | what is known about the device and why the lab is built this way |
@@ -101,9 +108,8 @@ an IDE's or another app's terminal pane: macOS may throttle it, and the sound cl
 
 Help is welcome on any of these:
 
-- **Firmware extractor** for the `AZ0x` update image, so that setup is one command. The
-  biggest barrier for new users today.
-- **Windows and Linux runs.** The code paths exist; only macOS (Apple Silicon) has been run.
+- **Windows and more Linux runs.** macOS (Apple Silicon) and Linux on x86_64 have been run
+  ([docs/LINUX.md](docs/LINUX.md)); Windows and Linux on arm64 (KVM) have not.
 - **Prebuilt kernel and audio bridge** as release downloads, so no 15-minute Docker build.
 - **CI** running `make test` (the lab and panel self-tests) on every pull request.
 - **USB audio (UAC2)** on the emulated USB-C; it is left out because it cannot bind on the
